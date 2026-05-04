@@ -24,12 +24,16 @@ import {
   Check,
   Search,
   Paperclip,
-  X
+  X,
+  FileArchive,
+  FileCode,
+  FolderArchive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark as theme } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import JSZip from 'jszip';
 import { generateAIResponse, ChatMessage } from './lib/gemini.ts';
 import { Mermaid } from './components/Mermaid.tsx';
 import { 
@@ -61,6 +65,7 @@ export default function App() {
     { id: '7d1a9c', msg: 'implemented core ai logic', date: 'Just now' }
   ]);
   const [selectedImage, setSelectedImage] = useState<{ data: string; mimeType: string } | null>(null);
+  const [attachedFile, setAttachedFile] = useState<{ name: string; type: string; size: number; file?: File } | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -141,32 +146,114 @@ export default function App() {
   };
 
   const handleSend = async () => {
-    if (!input.trim() && !selectedImage) return;
+    if ((!input.trim() && !selectedImage && !attachedFile) || isLoading) return;
 
-    const userMessage: ChatMessage = {
+    const currentInput = input;
+    const currentImage = selectedImage;
+    const currentFile = attachedFile;
+
+    // 1. Setup Initial User Message (UI Only)
+    const userDisplayMessage: ChatMessage = {
       role: 'user',
-      text: input,
-      image: selectedImage || undefined
+      text: currentFile ? `${currentInput}\n\n📎 *Attached file: ${currentFile.name}*` : currentInput,
+      image: currentImage || undefined
     };
 
-    setMessages(prev => [...prev, userMessage]);
+    // Pre-calculate zip context logic... (moved up)
+    let zipContext = '';
+    if (currentFile?.file && (currentFile.name.endsWith('.zip') || currentFile.type === 'application/zip')) {
+      try {
+        const zip = await JSZip.loadAsync(currentFile.file);
+        const fileContents: string[] = [];
+        let totalSize = 0;
+        const MAX_TOTAL_SIZE = 100000; // ~100KB limit for total context text
+        
+        const fileNames = Object.keys(zip.files);
+        for (const fileName of fileNames) {
+          if (totalSize > MAX_TOTAL_SIZE) break;
+          const file = zip.files[fileName];
+          if (!file.dir && (
+            fileName.match(/\.(ts|tsx|js|jsx|json|md|txt|css|html|yaml|yml|py|go|rs|c|cpp|h|sql|gradle|pom.xml|Dockerfile|yaml|yml)$/i) || 
+            fileName.toLowerCase().includes('readme') ||
+            fileName.toLowerCase().includes('config')
+          )) {
+            const content = await file.async('string');
+            const truncatedContent = content.length > 8000 ? content.substring(0, 8000) + '... [truncated]' : content;
+            fileContents.push(`\n--- FILE: ${fileName} ---\n${truncatedContent}`);
+            totalSize += truncatedContent.length;
+          }
+        }
+        
+        if (fileContents.length > 0) {
+          zipContext = `\n\n<PROJECT_ZIP_CONTEXT>\nThe user uploaded a ZIP archive named "${currentFile.name}". Here are the contents of relevant source files and configurations found inside:\n${fileContents.join('\n')}\n</PROJECT_ZIP_CONTEXT>`;
+        }
+      } catch (err) {
+        console.error('Zip analysis failed:', err);
+        zipContext = `\n\n[Warning: Failed to extract contents of the attached ZIP archive: ${currentFile.name}]`;
+      }
+    }
+
+    // Now set the message with full context in state
+    // The UI will split and hide the <PROJECT_ZIP_CONTEXT> part
+    const messageForState: ChatMessage = {
+      ...userDisplayMessage,
+      text: userDisplayMessage.text + zipContext
+    };
+
+    setMessages(prev => [...prev, messageForState]);
+    
     setInput('');
     setSelectedImage(null);
+    setAttachedFile(null);
     setPreviewUrl(null);
     setIsLoading(true);
 
+    // 3. Dispatch to AI
     try {
-      const response = await generateAIResponse(input, messages, userMessage.image);
-      const modelMessage: ChatMessage = {
-        role: 'model',
-        text: response
-      };
-      setMessages(prev => [...prev, modelMessage]);
+      let accumulatedText = "";
+      
+      // Add a placeholder message for the model response
+      setMessages(prev => [...prev, { role: 'model', text: "" }]);
+
+      let lastUpdateType = 0;
+      const throttleMs = 50; // Update every 50ms instead of every chunk
+
+      await generateAIResponse(
+        currentInput + zipContext, 
+        messages,
+        userDisplayMessage.image,
+        (chunk) => {
+          accumulatedText += chunk;
+          
+          const now = Date.now();
+          if (now - lastUpdateType > throttleMs) {
+            lastUpdateType = now;
+            setMessages(prev => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'model') {
+                last.text = accumulatedText;
+              }
+              return next;
+            });
+          }
+        }
+      );
+
+      // Final update to catch the end
+      setMessages(prev => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === 'model') {
+          last.text = accumulatedText;
+        }
+        return next;
+      });
     } catch (error) {
       console.error('AI Error:', error);
       setMessages(prev => [...prev, { 
         role: 'model', 
-        text: 'Error: Connection failed. Please check your API key and try again.' 
+        text: 'Error: Connection failed. The context might be too large or the server is unresponsive. Try again with a smaller file.' 
       }]);
     } finally {
       setIsLoading(false);
@@ -176,14 +263,66 @@ export default function App() {
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const base64Data = (reader.result as string).split(',')[1];
-        setSelectedImage({ data: base64Data, mimeType: file.type });
-        setPreviewUrl(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+      if (file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64Data = (reader.result as string).split(',')[1];
+          setSelectedImage({ data: base64Data, mimeType: file.type });
+          setAttachedFile(null);
+          setPreviewUrl(reader.result as string);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // Handle generic files (zip, txt, etc.)
+        setAttachedFile({
+          name: file.name,
+          type: file.type || 'application/octet-stream',
+          size: file.size,
+          file: file
+        });
+        setSelectedImage(null);
+        setPreviewUrl(null);
+      }
     }
+  };
+
+  const downloadProjectZip = async () => {
+    const zip = new JSZip();
+    
+    // 1. Add Chat History
+    const timestamp = new Date().toLocaleString();
+    let chatContent = `# Lumina Kernel - Project Backup\nExported on: ${timestamp}\n\n---\n\n`;
+    messages.forEach((msg, index) => {
+      const role = msg.role === 'user' ? 'USER' : 'LUMINA';
+      chatContent += `### ${role}\n${msg.text}\n\n---\n\n`;
+    });
+    zip.file("chat_history.md", chatContent);
+
+    // 2. Add Architecture Diagrams as individual files
+    messages.forEach((msg, i) => {
+      const mermaidMatch = msg.text.match(/```mermaid([\s\S]*?)```/g);
+      if (mermaidMatch) {
+         mermaidMatch.forEach((match, j) => {
+           const code = match.replace(/```mermaid|```/g, '').trim();
+           zip.file(`diagrams/diagram_${i}_${j}.mermaid`, code);
+         });
+      }
+    });
+
+    // 3. Add VCS History
+    let vcsContent = gitHistory.map(h => `[${h.id}] ${h.date}: ${h.msg}`).join('\n');
+    zip.file("vcs_history.txt", vcsContent);
+
+    // Generate and Download
+    const content = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `lumina-project-${new Date().getTime()}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const clearChat = () => {
@@ -446,6 +585,13 @@ export default function App() {
               </div>
 
               <button 
+                onClick={downloadProjectZip}
+                className="w-full py-3 bg-white/5 border border-white/10 text-white/60 text-[10px] font-bold uppercase tracking-widest rounded-xl hover:bg-white/10 transition-all flex items-center justify-center gap-2 mb-2"
+              >
+                <FolderArchive className="w-4 h-4" /> Export Project (ZIP)
+              </button>
+
+              <button 
                 onClick={commitChat}
                 className="w-full py-3 bg-orange-500 text-black text-[10px] font-bold uppercase tracking-widest rounded-xl hover:bg-orange-400 transition-all flex items-center justify-center gap-2 shadow-lg shadow-orange-500/20"
               >
@@ -623,7 +769,7 @@ export default function App() {
                             }
                           }}
                         >
-                          {msg.text}
+                          {msg.text.split('<PROJECT_ZIP_CONTEXT>')[0]}
                         </ReactMarkdown>
                       </div>
                     </div>
@@ -670,7 +816,9 @@ export default function App() {
                           className="w-2 h-2 bg-orange-500 rounded-full" 
                         />
                       </div>
-                      <span className="text-xs text-white/40 font-mono italic">Architecting...</span>
+                      <span className="text-xs text-white/40 font-mono italic">
+                        {attachedFile ? 'Analyzing Repository...' : 'Architecting...'}
+                      </span>
                     </div>
                     <motion.div 
                       initial={{ width: "0%" }}
@@ -687,7 +835,7 @@ export default function App() {
           {/* Console / Input Area */}
           <div className="mt-6 relative">
             <AnimatePresence>
-              {previewUrl && (
+              {(previewUrl || attachedFile) && (
                 <motion.div
                   initial={{ y: 20, opacity: 0 }}
                   animate={{ y: 0, opacity: 1 }}
@@ -695,17 +843,25 @@ export default function App() {
                   className="absolute bottom-full left-0 mb-4 p-2 bg-[#1A1A1A] border border-white/10 rounded-2xl shadow-2xl flex items-center gap-4 z-40"
                 >
                   <div className="relative group">
-                    <img src={previewUrl} alt="Preview" className="w-20 h-20 object-cover rounded-xl" />
+                    {previewUrl ? (
+                      <img src={previewUrl} alt="Preview" className="w-20 h-20 object-cover rounded-xl" />
+                    ) : (
+                      <div className="w-20 h-20 bg-orange-500/10 border border-orange-500/20 rounded-xl flex items-center justify-center">
+                        <FileArchive className="w-8 h-8 text-orange-500" />
+                      </div>
+                    )}
                     <button 
-                      onClick={() => { setPreviewUrl(null); setSelectedImage(null); }}
+                      onClick={() => { setPreviewUrl(null); setSelectedImage(null); setAttachedFile(null); }}
                       className="absolute -top-2 -right-2 p-1 bg-red-500 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity shadow-lg"
                     >
                       <X className="w-3 h-3" />
                     </button>
                   </div>
                   <div className="pr-4">
-                    <p className="text-xs font-mono text-white/60">Image Payload Ready</p>
-                    <p className="text-[10px] text-white/30 uppercase tracking-tighter">Multipart/form-data</p>
+                    <p className="text-xs font-mono text-white/60">{attachedFile ? attachedFile.name : 'Image Payload'} Ready</p>
+                    <p className="text-[10px] text-white/30 uppercase tracking-tighter">
+                      {attachedFile ? `${attachedFile.type} • ${(attachedFile.size / 1024).toFixed(1)}KB` : 'Multipart/form-data'}
+                    </p>
                   </div>
                 </motion.div>
               )}
@@ -761,7 +917,7 @@ export default function App() {
                   ref={fileInputRef} 
                   onChange={handleFileChange} 
                   className="hidden" 
-                  accept="image/*"
+                  accept="image/*,.zip,.rar,.7z,.pdf,.txt,.js,.ts,.tsx,.json"
                 />
 
                 <input
@@ -775,9 +931,9 @@ export default function App() {
 
                 <button
                   onClick={handleSend}
-                  disabled={isLoading || (!input.trim() && !selectedImage)}
+                  disabled={isLoading || (!input.trim() && !selectedImage && !attachedFile)}
                   className={`p-3 rounded-2xl transition-all flex items-center gap-2 ${
-                    isLoading || (!input.trim() && !selectedImage)
+                    isLoading || (!input.trim() && !selectedImage && !attachedFile)
                       ? 'bg-white/5 text-white/10'
                       : 'bg-orange-500 text-black hover:bg-orange-400 active:scale-95 shadow-lg shadow-orange-500/20'
                   }`}

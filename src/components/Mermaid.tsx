@@ -28,12 +28,71 @@ export const Mermaid = ({ chart }: MermaidProps) => {
   useEffect(() => {
     const renderChart = async () => {
       try {
+        let processedChart = chart.trim();
+        
+        // Basic AI correction: If it starts with subgraph, wrap it in graph TD
+        if (processedChart.startsWith('subgraph') && !processedChart.includes('graph ') && !processedChart.includes('flowchart ')) {
+          processedChart = `graph TD\n${processedChart}`;
+        }
+
+        // Fix quoted IDs (e.g., "Node"["Label"] -> Node["Label"])
+        processedChart = processedChart.replace(/"([^"\[\(\{\>]+)"\s*([\[\(\{\>])/g, (_, id, bracket) => {
+          return id.trim().replace(/[^a-zA-Z0-9]/g, '_') + bracket;
+        });
+
+        // Quote subgraph titles if they have spaces and are not quoted
+        processedChart = processedChart.replace(/^(\s*)subgraph\s+([^"\r\n\[\]\(\)\{\}]+)$/gm, (match, space, title) => {
+          const trimmed = title.trim();
+          if (trimmed.includes(' ') && !trimmed.startsWith('"')) {
+            // Check if it's already an ID + Title pattern: subgraph ID [Title]
+            if (trimmed.includes('[') || trimmed.includes('(') || trimmed.includes('{')) return match;
+            return `${space}subgraph "${trimmed}"`;
+          }
+          return match;
+        });
+
+        // Ensure all labels with special characters are quoted
+        processedChart = processedChart.replace(/([\[\(\{\>])([^"\]\)\}\r\n]+)([\]\)\}\r\n])/g, (match, open, content, close) => {
+          const trimmed = content.trim();
+          if (trimmed.startsWith('"') && trimmed.endsWith('"')) return match;
+          // If it contains spaces or special chars, quote it
+          if (/[^a-zA-Z0-9\s]/.test(trimmed) || trimmed.includes(' ') || trimmed.includes('/') || trimmed.includes('(') || trimmed.includes(')')) {
+            // Escape any existing double quotes in the content
+            const escaped = trimmed.replace(/"/g, '\"');
+            return `${open}"${escaped}"${close}`;
+          }
+          return match;
+        });
+
+        // Catch naked IDs with spaces (e.g., App Server["Desc"] -> App_Server["Desc"])
+        // We exclude reserved keywords at the start to avoid merging "graph TD" or "subgraph"
+        const keywords = ['graph', 'flowchart', 'subgraph', 'end', 'stateDiagram', 'sequenceDiagram', 'classDiagram', 'erDiagram', 'gantt', 'pie', 'gitGraph', 'classDef', 'style', 'class'];
+        processedChart = processedChart.replace(/^(\s*)([a-zA-Z0-9][a-zA-Z0-9\s-]+)(\[|\{|\(|\>)/gm, (_, space, id, bracket) => {
+          const trimmedId = id.trim();
+          const firstWord = trimmedId.split(/\s+/)[0].toLowerCase();
+          if (keywords.includes(firstWord)) return _; // Skip keywords
+          return space + trimmedId.replace(/\s+/g, '_') + bracket;
+        });
+        
+        // Ensure no stray markdown code block markers
+        processedChart = processedChart.replace(/^```mermaid\n?/, '').replace(/\n?```$/, '');
+
         const id = `mermaid-${Math.random().toString(36).substr(2, 9)}`;
-        const { svg } = await mermaid.render(id, chart);
+        const { svg } = await mermaid.render(id, processedChart);
         setSvg(svg);
       } catch (error) {
         console.error('Mermaid render error:', error);
-        setSvg('<div class="text-red-500 font-mono text-xs">Failed to render diagram. Check Mermaid syntax.</div>');
+        setSvg(`<div class="text-red-500 font-mono text-[10px] p-4 bg-red-500/10 border border-red-500/20 rounded-xl relative group/error">
+          <p class="font-bold mb-1 flex items-center gap-2">
+            <span class="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+            Diagram Syntax Error
+          </p>
+          <pre class="whitespace-pre-wrap mb-2 opacity-80">${error instanceof Error ? error.message : 'Invalid Mermaid syntax'}</pre>
+          <div className="hidden group-hover/error:block border-t border-red-500/10 pt-2">
+            <p class="text-[9px] uppercase tracking-wider mb-1 opacity-40">Raw Input:</p>
+            <pre class="bg-black/40 p-2 rounded text-[9px] overflow-x-auto">${chart}</pre>
+          </div>
+        </div>`);
       }
     };
 

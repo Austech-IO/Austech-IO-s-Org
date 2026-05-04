@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { GoogleGenAI, GenerateContentResponse, ThinkingLevel } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 
 // Initialize AI client lazily to avoid crashing if key is missing
 let aiClient: GoogleGenAI | null = null;
@@ -31,7 +31,8 @@ export interface ChatMessage {
 export const generateAIResponse = async (
   prompt: string,
   history: ChatMessage[] = [],
-  image?: { data: string; mimeType: string }
+  image?: { data: string; mimeType: string },
+  onChunk?: (chunk: string) => void
 ): Promise<string> => {
   const ai = getAIClient();
 
@@ -43,7 +44,6 @@ export const generateAIResponse = async (
     ]
   }));
 
-  // Append current message
   contents.push({
     role: 'user',
     parts: [
@@ -52,18 +52,45 @@ export const generateAIResponse = async (
     ]
   });
 
+  const model = "gemini-2.0-flash"; // Switched for maximum speed and robustness
+
+  if (onChunk) {
+    const result = await ai.models.generateContentStream({
+      model,
+      contents,
+      config: {
+        systemInstruction: "You are Lumina, an elite AI Software Architect. \n" +
+          "1. CONCISE: Be direct and technical. \n" +
+          "2. MERMAID SYNTAX: Use strictly alphanumeric IDs (e.g., ID1, AppServer) with NO spaces or quotes. \n" +
+          "3. DESCRIPTIVE LABELS: Put all descriptive text in double-quoted labels (e.g., ID1[\"User Service\"] or ID2{\"Decision?\"}). \n" +
+          "4. NO QUOTED IDs: Never put double quotes around the node ID itself (e.g., NEVER \"ID1\"[\"Label\"]). \n" +
+          "5. DIAGRAM STRUCTURE: Start with 'graph TD'. Match every 'subgraph' with an 'end'. Quote subgraph titles properly. \n" +
+          "6. NO SPECIAL CHARS: Never use /, &, (, ), -, or spaces in node IDs. Use them ONLY inside double-quoted labels. \n" +
+          "7. ZIP CONTEXT: Use <PROJECT_ZIP_CONTEXT> if present for project-specific insights.",
+      }
+    });
+
+    let fullText = "";
+    for await (const chunk of result) {
+      const chunkText = chunk.text || "";
+      fullText += chunkText;
+      onChunk(chunkText);
+    }
+    return fullText;
+  }
+
   const response: GenerateContentResponse = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model,
     contents,
     config: {
-      systemInstruction: "You are Lumina, an elite AI Software Architect and Engineer. \n\n" +
-        "1. ARCHITECTURE: When asked for architectural diagrams, use Mermaid JS syntax. Wrap diagrams in ```mermaid blocks. \n" +
-        "2. CODE GENERATION: Provide modular, clean code. Use correct language tags. \n" +
-        "3. DEBUGGING: When an error is provided, analyze the stack trace, identify the root cause, and offer a 'Fix' and a 'Prevention' strategy. \n" +
-        "4. EXPLANATIONS: Use structured markdown. When explaining code, break it down by logic blocks. \n" +
-        "5. REFACTORING: When asked to refactor, prioritize readability, performance, and DRY principles. \n" +
-        "6. INTERACTIVITY: You can answer follow-up questions about specific parts of your previous responses.",
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+      systemInstruction: "You are Lumina, an elite AI Software Architect. \n" +
+        "1. CONCISE: Be direct and technical. \n" +
+        "2. MERMAID SYNTAX: Use strictly alphanumeric IDs (e.g., ID1, AppServer) with NO spaces or quotes. \n" +
+        "3. DESCRIPTIVE LABELS: Put all descriptive text in double-quoted labels (e.g., ID1[\"User Service\"] or ID2{\"Decision?\"}). \n" +
+        "4. NO QUOTED IDs: Never put double quotes around the node ID itself (e.g., NEVER \"ID1\"[\"Label\"]). \n" +
+        "5. DIAGRAM STRUCTURE: Start with 'graph TD'. Match every 'subgraph' with an 'end'. Quote subgraph titles properly. \n" +
+        "6. NO SPECIAL CHARS: Never use /, &, (, ), -, or spaces in node IDs. Use them ONLY inside double-quoted labels. \n" +
+        "7. ZIP CONTEXT: Use <PROJECT_ZIP_CONTEXT> if present for project-specific insights.",
     }
   });
 
