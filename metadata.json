@@ -1,0 +1,6 @@
+{
+  "name": "Lumina AI Assistant",
+  "description": "A high-performance multi-modal AI companion capable of vision, reasoning, and creative collaboration.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}
